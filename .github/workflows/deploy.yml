@@ -1,0 +1,191 @@
+name: Deploy Restaurant 3D Menu
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  NODE_VERSION: '18'
+  PNPM_VERSION: '8'
+
+jobs:
+  test:
+    name: 🧪 Run Tests
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: 📥 Checkout code
+      uses: actions/checkout@v4
+
+    - name: ⎔ Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'pnpm'
+
+    - name: 📦 Install pnpm
+      uses: pnpm/action-setup@v2
+      with:
+        version: ${{ env.PNPM_VERSION }}
+
+    - name: 📦 Install dependencies
+      run: pnpm install
+
+    - name: 🧪 Run unit tests
+      run: pnpm test:unit
+
+    - name: 🧪 Run integration tests
+      run: pnpm test:integration
+
+    - name: 📊 Upload test results
+      uses: actions/upload-artifact@v3
+      with:
+        name: test-results
+        path: test-results/
+        retention-days: 7
+
+  build:
+    name: 🏗️ Build Project
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    
+    steps:
+    - name: 📥 Checkout code
+      uses: actions/checkout@v4
+
+    - name: ⎔ Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'pnpm'
+
+    - name: 📦 Install pnpm
+      uses: pnpm/action-setup@v2
+      with:
+        version: ${{ env.PNPM_VERSION }}
+
+    - name: 📦 Install dependencies
+      run: pnpm install
+
+    - name: 🏗️ Build project
+      run: pnpm build:${{ github.ref == 'refs/heads/main' && 'production' || 'staging' }}
+      env:
+        GA_TRACKING_ID: ${{ secrets.GA_TRACKING_ID }}
+        NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+
+    - name: 📦 Upload build artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: build-${{ github.ref == 'refs/heads/main' && 'production' || 'staging' }}
+        path: dist/
+        retention-days: 7
+
+  lighthouse:
+    name: ⚡ Lighthouse Audit
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    
+    steps:
+    - name: 📥 Checkout code
+      uses: actions/checkout@v4
+
+    - name: 📥 Download build artifacts
+      uses: actions/download-artifact@v3
+      with:
+        name: build-${{ github.ref == 'refs/heads/main' && 'production' || 'staging' }}
+        path: dist
+
+    - name: 🏗️ Setup Lighthouse
+      run: |
+        npm install -g @lhci/cli@0.12.x
+        npm install -g http-server
+
+    - name: 🌐 Start local server
+      run: |
+        cd dist
+        npx http-server -p 8080 --silent &
+        echo "SERVER_PID=$!" >> $GITHUB_ENV
+
+    - name: 📊 Run Lighthouse CI
+      run: |
+        lhci autorun
+      env:
+        LHCI_GITHUB_APP_TOKEN: ${{ secrets.LHCI_GITHUB_APP_TOKEN }}
+
+    - name: 💀 Stop local server
+      if: always()
+      run: kill $SERVER_PID || true
+
+  deploy-staging:
+    name: 🚀 Deploy to Staging
+    needs: [test, build, lighthouse]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
+    environment: staging
+    
+    steps:
+    - name: 📥 Checkout code
+      uses: actions/checkout@v4
+
+    - name: 📥 Download build artifacts
+      uses: actions/download-artifact@v3
+      with:
+        name: build-staging
+        path: dist
+
+    - name: 🚀 Deploy to Netlify
+      run: pnpm deploy:staging
+      env:
+        NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+        NETLIFY_STAGING_SITE_ID: ${{ secrets.NETLIFY_STAGING_SITE_ID }}
+
+    - name: 📝 Create deployment comment
+      uses: actions/github-script@v6
+      with:
+        script: |
+          github.rest.repos.createCommitComment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            commit_sha: context.sha,
+            body: '🚀 Successfully deployed to staging environment!'
+          })
+
+  deploy-production:
+    name: 🚀 Deploy to Production
+    needs: [test, build, lighthouse]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production
+    
+    steps:
+    - name: 📥 Checkout code
+      uses: actions/checkout@v4
+
+    - name: 📥 Download build artifacts
+      uses: actions/download-artifact@v3
+      with:
+        name: build-production
+        path: dist
+
+    - name: 🚀 Deploy to Netlify
+      run: pnpm deploy:production
+      env:
+        NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+        NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
+        GA_TRACKING_ID: ${{ secrets.GA_TRACKING_ID }}
+
+    - name: 📧 Send deployment notification
+      uses: actions/github-script@v6
+      with:
+        script: |
+          github.rest.issues.create({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            title: 'Production Deployment Complete',
+            body: `✅ Successfully deployed to production!\n\n- Commit: ${context.sha}\n- Environment: production\n- Timestamp: ${new Date().toISOString()}`,
+            labels: ['deployment', 'production']
+          })
